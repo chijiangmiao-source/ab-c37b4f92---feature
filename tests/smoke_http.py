@@ -179,6 +179,108 @@ def run_checks(base: str, managed_proc, managed_tmp) -> int:
         status, _ = request("GET", f"{base}/api/audit?auditId=NOPE", expect=404)
         check("unknown auditId -> 404", status == 404)
 
+        # 10. byte-provenance tracing over a frozen accepted verdict.
+        # T1 commits an update [0,16) kept by redo; loser T2's [8,16)
+        # update is redone then undone.  The undo writes back T2's before
+        # image — which equals T1's surviving after bytes (aa).  So [0,16)
+        # ends uniformly aa, yet [0,8) is redo@T1/LSN20 while [8,16) is the
+        # undo write-back@T2/LSN60: identical hex must NOT merge.
+        provenance_payload = {
+            "auditId": "SMOKE-PROV",
+            "pages": [{"page": 7, "pageLSN": 10, "data": Z}],
+            "wal": [
+                {"lsn": 10, "type": "begin", "xid": "T1"},
+                {"lsn": 20, "type": "update", "xid": "T1", "prevLSN": 10,
+                 "page": 7, "offset": 0, "before": "00" * 16, "after": "aa" * 16},
+                {"lsn": 30, "type": "commit", "xid": "T1", "prevLSN": 20},
+                {"lsn": 40, "type": "end", "xid": "T1", "prevLSN": 30},
+                {"lsn": 50, "type": "begin", "xid": "T2"},
+                {"lsn": 60, "type": "update", "xid": "T2", "prevLSN": 50,
+                 "page": 7, "offset": 8, "before": "aa" * 8, "after": "cc" * 8},
+            ],
+        }
+        status, payload = request("POST", f"{base}/api/recover", provenance_payload, expect=200)
+        check("provenance scenario accepted", payload["status"] == "accepted")
+
+        status, q = request(
+            "GET", f"{base}/api/provenance?auditId=SMOKE-PROV&page=7&start=0&end=24",
+            expect=200,
+        )
+        frags = q.get("fragments", [])
+        expected = [
+            (0, 8, "redo", "T1", 20, "aa" * 8),
+            (8, 16, "undo", "T2", 60, "aa" * 8),
+            (16, 24, "crash-image", None, None, "00" * 8),
+        ]
+        actual = [(f["start"], f["end"], f["category"], f["xid"], f["lsn"], f["hex"])
+                  for f in frags]
+        check("provenance fragments: redo / undo / crash-image",
+              actual == expected, str(actual))
+        # gap-free, non-overlapping, ascending partition of the request range
+        covered = (
+            frags
+            and frags[0]["start"] == 0
+            and frags[-1]["end"] == 24
+            and all(a["end"] == b["start"] for a, b in zip(frags, frags[1:]))
+            and sum(f["length"] for f in frags) == 24
+        )
+        check("provenance partition has no gap/overlap", covered)
+        # sub-range clipped at the request edge
+        status, q = request(
+            "GET", f"{base}/api/provenance?auditId=SMOKE-PROV&page=7&start=4&end=12",
+            expect=200,
+        )
+        actual = [(f["start"], f["end"], f["category"], f["lsn"]) for f in q["fragments"]]
+        check("provenance sub-range clipped",
+              actual == [(4, 8, "redo", 20), (8, 12, "undo", 60)], str(actual))
+        # end == 4096 is the legal page boundary
+        status, q = request(
+            "GET", f"{base}/api/provenance?auditId=SMOKE-PROV&page=7&start=4094&end=4096",
+            expect=200,
+        )
+        check("provenance boundary end=4096 accepted",
+              q["fragments"][0]["end"] == 4096 and
+              q["fragments"][0]["category"] == "crash-image")
+
+        # 11. actionable provenance errors
+        status, payload = request(
+            "GET", f"{base}/api/provenance?auditId=NOPE&page=7&start=0&end=4", expect=404)
+        check("provenance unknown audit -> 404",
+              status == 404 and "无审计标识" in payload["error"])
+        status, payload = request(
+            "GET", f"{base}/api/provenance?auditId=SMOKE-PROV&page=99&start=0&end=4",
+            expect=404)
+        check("provenance unknown page -> 404", status == 404 and "99" in payload["error"])
+        status, payload = request(
+            "GET", f"{base}/api/provenance?auditId=SMOKE-PROV&page=7&start=0&end=4097",
+            expect=400)
+        check("provenance range past 4096 -> 400", status == 400 and "4096" in payload["error"])
+        status, payload = request(
+            "GET", f"{base}/api/provenance?auditId=SMOKE-PROV&page=7&start=8&end=2",
+            expect=400)
+        check("provenance empty/reversed range -> 400", status == 400)
+        status, payload = request(
+            "GET", f"{base}/api/provenance?auditId=SMOKE-PROV&page=7&start=0",
+            expect=400)
+        check("provenance missing end -> 400", status == 400)
+        # rejected audit: no success evidence to trace -> 409, frozen row intact
+        status, payload = request(
+            "GET", f"{base}/api/provenance?auditId=SMOKE-REJECT&page=1&start=0&end=4",
+            expect=409)
+        check("provenance on rejected audit -> 409",
+              status == 409 and payload["status"] == "rejected")
+
+        # 12. provenance is strictly read-only: the frozen accepted verdict
+        # survives every query (and the rejected one stays rejected).
+        status, payload = request("GET", f"{base}/api/audit?auditId=SMOKE-PROV")
+        check("accepted verdict untouched after provenance queries",
+              status == 200 and payload["status"] == "accepted"
+              and payload["verdict"]["redone"] == 2
+              and payload["verdict"]["undone"] == 1)
+        status, payload = request("GET", f"{base}/api/audit?auditId=SMOKE-REJECT")
+        check("rejected verdict untouched after provenance queries",
+              payload["status"] == "rejected" and "verdict" not in payload)
+
     except Exception as exc:  # noqa: BLE001
         import traceback
         traceback.print_exc()

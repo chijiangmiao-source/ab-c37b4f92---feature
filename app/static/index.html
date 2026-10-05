@@ -78,6 +78,31 @@
         <tbody></tbody>
       </table>
     </div>
+
+    <h3>字节来源追溯（页号 + 半开字节区间）</h3>
+    <div class="row-between">
+      <span class="hint">对已冻结的成功裁决按 <code>[start,end)</code> 查询：覆盖该区间的连续来源片段，
+        逐段给出最终十六进制、来源类别（崩溃页像 / 重做 / 撤销回写）及关联事务与 LSN；
+        仅相邻且来源证据完全相同的片段才会合并，无重叠、无空洞、按偏移升序。</span>
+    </div>
+    <div class="buttons prov-form">
+      <label class="prov-field">页号 <input id="provPage" type="number" min="0" placeholder="如 7"></label>
+      <label class="prov-field">start <input id="provStart" type="number" min="0" max="4095" placeholder="0"></label>
+      <label class="prov-field">end <input id="provEnd" type="number" min="1" max="4096" placeholder="32"></label>
+      <button id="provQuery" class="primary" type="button">追溯字节来源</button>
+    </div>
+    <div id="provStatus" class="status" role="status"></div>
+    <div class="table-wrap">
+      <table id="provTable">
+        <thead>
+          <tr>
+            <th>半开区间 [start,end)</th><th>长度</th><th>来源类别</th>
+            <th>事务</th><th>LSN</th><th>最终字节（十六进制）</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
   </section>
 </main>
 

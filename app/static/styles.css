@@ -127,3 +127,16 @@ th { position: sticky; top: 0; background: var(--panel2); color: var(--muted); z
 .summ-item .v { font-size: 16px; font-weight: 600; margin-top: 2px; word-break: break-all; }
 footer { padding: 0 28px 24px; color: var(--muted); font-size: 12px; max-width: 1500px; margin: 0 auto; }
 code { color: #9cc2ff; }
+.prov-form { margin: 8px 0 4px; }
+.prov-field { font-size: 12.5px; color: var(--muted); display: inline-flex; align-items: center; gap: 6px; }
+.prov-field input {
+  width: 92px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 7px 9px;
+  font-size: 13px;
+}
+.prov-field input:focus { outline: none; border-color: var(--accent); }
+.hexcell { word-break: break-all; max-width: 520px; color: #c9f7d0; }

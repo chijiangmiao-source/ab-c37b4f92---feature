@@ -18,9 +18,22 @@ const els = {
   onlyChanged: $("#onlyChanged"),
   lookup: $("#lookup"),
   lookupId: $("#lookupId"),
+  provPage: $("#provPage"),
+  provStart: $("#provStart"),
+  provEnd: $("#provEnd"),
+  provQuery: $("#provQuery"),
+  provStatus: $("#provStatus"),
+  provBody: $("#provTable tbody"),
 };
 
 let sampleCache = null;
+let currentAuditId = null;
+
+const PROV_CATEGORY = {
+  redo: "重做更新",
+  undo: "撤销回写",
+  "crash-image": "崩溃页像",
+};
 
 function setStatus(kind, text) {
   els.status.className = `status ${kind}`;
@@ -45,7 +58,11 @@ function shortSha(sha) {
 
 function renderVerdict(v) {
   window._lastTrace = v.trace;
+  currentAuditId = v.auditId;
   els.verdictCard.classList.remove("hidden");
+  els.provBody.innerHTML = "";
+  els.provStatus.textContent = "";
+  els.provStatus.className = "status";
   const dptText = Object.entries(v.dirtyPageTableAtEnd)
     .map(([p, l]) => `${p}:${l}`)
     .join(", ") || "∅（全部已落盘）";
@@ -171,9 +188,91 @@ async function lookupVerdict() {
   }
 }
 
+async function queryProvenance() {
+  const id = currentAuditId;
+  if (!id) {
+    setProvStatus("err", "请先提交成功恢复或按 auditId 读取一个成功裁决，再追溯字节来源。");
+    return;
+  }
+  const page = els.provPage.value.trim();
+  const start = els.provStart.value.trim();
+  const end = els.provEnd.value.trim();
+  if (page === "" || start === "" || end === "") {
+    setProvStatus("err", "请同时填写页号、start 与 end（半开区间 [start,end)，0 ≤ start < end ≤ 4096）。");
+    return;
+  }
+  if (!Number.isInteger(Number(page)) || !Number.isInteger(Number(start)) || !Number.isInteger(Number(end))) {
+    setProvStatus("err", "页号、start、end 必须是整数。");
+    return;
+  }
+  const qs = new URLSearchParams({
+    auditId: id, page, start, end,
+  }).toString();
+  setProvStatus("info", `追溯页 ${page} 字节区间 [${start},${end}) …`);
+  try {
+    const resp = await fetch(`/api/provenance?${qs}`);
+    const data = await resp.json();
+    if (!resp.ok) {
+      const hint = {
+        400: "请修正查询参数后重试。",
+        404: "请先建立该成功审计，或改用裁决中的已知页号。",
+        409: "该标识没有可追溯的成功证据。",
+      }[resp.status] || "";
+      setProvStatus("err", `追溯失败（HTTP ${resp.status}）：${data.error || ""} ${hint}`);
+      els.provBody.innerHTML = "";
+      return;
+    }
+    renderProvenance(data);
+  } catch (e) {
+    setProvStatus("err", `请求失败：${e.message}`);
+  }
+}
+
+function setProvStatus(kind, text) {
+  els.provStatus.className = `status ${kind}`;
+  els.provStatus.textContent = text;
+}
+
+function renderProvenance(data) {
+  els.provBody.innerHTML = "";
+  const fr = data.fragments || [];
+  // Defensive coverage check of the server-guaranteed partition.
+  let covered = 0;
+  for (const f of fr) {
+    const tr = document.createElement("tr");
+    const cat = PROV_CATEGORY[f.category] || f.category;
+    const catClass = f.category === "redo" ? "redo" : f.category === "undo" ? "undo" : "unchanged";
+    tr.innerHTML = `
+      <td class="monospace">[${f.start}, ${f.end})</td>
+      <td class="monospace">${f.length}</td>
+      <td><span class="pill ${catClass}">${esc(cat)}</span></td>
+      <td class="monospace">${esc(f.xid || "—")}</td>
+      <td class="monospace">${lsn(f.lsn)}</td>
+      <td class="monospace hexcell">${esc(f.hex)}</td>`;
+    els.provBody.appendChild(tr);
+    covered += f.length;
+  }
+  const span = data.end - data.start;
+  if (covered !== span) {
+    setProvStatus("err", `服务端片段覆盖 ${covered} 字节，与请求区间 ${span} 字节不一致。`);
+    return;
+  }
+  setProvStatus(
+    "ok",
+    `页 ${data.page} 区间 [${data.start},${data.end}) 共 ${span} 字节，` +
+    `${fr.length} 段连续来源（无重叠、无空洞、升序；仅证据完全相同才合并）。`
+  );
+}
+
 document.addEventListener("DOMContentLoaded", () => {
   els.submit.addEventListener("click", submitRecovery);
   els.lookup.addEventListener("click", lookupVerdict);
+  els.provQuery.addEventListener("click", queryProvenance);
+  [els.provPage, els.provStart, els.provEnd].forEach((input) => {
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") queryProvenance();
+    });
+  });
   els.loadSample.addEventListener("click", () => {
     if (sampleCache) {
       els.payload.value = JSON.stringify(sampleCache, null, 2);

@@ -9,6 +9,12 @@ POST /api/recover           submit pages + WAL; returns a frozen verdict or a
                             stable rejection (HTTP 422).  A rejection for an
                             audit id removes any previously frozen success.
 GET  /api/audit?auditId=..  read the frozen verdict / rejection
+GET  /api/provenance?auditId=..&page=..&start=..&end=..
+                            byte-level provenance of a half-open in-page
+                            interval over a frozen accepted verdict: the
+                            contiguous source fragments (crash image / redone
+                            update / undone write-back) that last wrote every
+                            byte, with final hex, xid and LSN.  Read-only.
 GET  /api/sample            a ready-to-use demo payload
 
 Standard library only.
@@ -27,7 +33,13 @@ from urllib.parse import parse_qs, urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from recovery import RecoveryError, recover  # noqa: E402
+from recovery import (  # noqa: E402
+    PAGE_SIZE,
+    ProvenanceError,
+    RecoveryError,
+    query_byte_provenance,
+    recover,
+)
 from storage import AuditStore  # noqa: E402
 
 STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
@@ -113,6 +125,9 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send_json(HTTPStatus.OK, row)
             return
+        if path == "/api/provenance":
+            self._handle_provenance(parse_qs(parsed.query))
+            return
         if path == "/" or path == "/index.html":
             self._send_file("index.html", "text/html; charset=utf-8")
             return
@@ -124,6 +139,78 @@ class Handler(BaseHTTPRequestHandler):
             self._send_file(name, ctype)
             return
         self._send_json(HTTPStatus.NOT_FOUND, {"error": "not found"})
+
+    def _handle_provenance(self, qs: dict[str, list[str]]) -> None:
+        """GET /api/provenance?auditId=..&page=..&start=..&end=..
+
+        Read-only byte-provenance trace over a frozen ACCEPTED verdict.
+        Never mutates the frozen row: a rejected audit answers 409, an
+        unknown audit or page answers 404, and a malformed/out-of-range
+        interval answers 400 — in every case with an actionable message.
+        """
+        audit_id = (qs.get("auditId") or [""])[0].strip()
+        if not audit_id:
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": "缺少 auditId 查询参数（需配合 page、start、end 一起提供）"},
+            )
+            return
+
+        def one_int(name: str) -> Optional[int]:
+            raw = (qs.get(name) or [None])[0]
+            if raw is None or raw.strip() == "":
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": f"缺少 {name} 查询参数（半开区间 [start,end)，均为 0..{PAGE_SIZE} 的整数）"},
+                )
+                return None
+            try:
+                value = int(raw)
+            except (TypeError, ValueError):
+                self._send_json(
+                    HTTPStatus.BAD_REQUEST,
+                    {"error": f"{name}={raw!r} 不是合法整数；应为 0..{PAGE_SIZE} 范围内的字节偏移"},
+                )
+                return None
+            return value
+
+        page_no = one_int("page")
+        if page_no is None:
+            return
+        start = one_int("start")
+        if start is None:
+            return
+        end = one_int("end")
+        if end is None:
+            return
+
+        row = self.store.get(audit_id)
+        if row is None:
+            self._send_json(
+                HTTPStatus.NOT_FOUND,
+                {"error": f"无审计标识 {audit_id} 的冻结裁决；请先 POST /api/recover 成功建立审计"},
+            )
+            return
+        if row.get("status") != "accepted":
+            self._send_json(
+                HTTPStatus.CONFLICT,
+                {
+                    "status": "rejected",
+                    "auditId": audit_id,
+                    "error": (
+                        f"审计 {audit_id} 的裁决为稳定拒绝，不存在可追溯的成功证据；"
+                        f"拒绝原因：{row.get('error')}"
+                    ),
+                },
+            )
+            return
+
+        try:
+            result = query_byte_provenance(row["verdict"], page_no, start, end)
+        except ProvenanceError as exc:
+            self._send_json(exc.http_status, {"error": str(exc), "auditId": audit_id})
+            return
+        self._send_json(HTTPStatus.OK, result)
 
     def do_POST(self) -> None:  # noqa: N802
         if urlparse(self.path).path != "/api/recover":

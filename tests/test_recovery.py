@@ -11,7 +11,13 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app"))
 
-from recovery import RecoveryError, recover  # noqa: E402
+from recovery import (  # noqa: E402
+    PAGE_SIZE,
+    ProvenanceError,
+    RecoveryError,
+    query_byte_provenance,
+    recover,
+)
 from storage import AuditStore  # noqa: E402
 
 ZEROS = "00" * 4096
@@ -382,6 +388,151 @@ class StableRejectionTests(unittest.TestCase):
     def test_missing_audit_id_rejected(self):
         with self.assertRaises(RecoveryError):
             recover({"pages": [page(0)], "wal": []})
+
+
+class ProvenanceTests(unittest.TestCase):
+    """Byte-level provenance over frozen successful verdicts."""
+
+    def _overlap_verdict(self):
+        # Page 5 starts all-zero (pageLSN 10):
+        #  T1 commits: LSN20 [0,16)  00 -> aa*16
+        #              LSN30 [8,24)  aa*8+00*8 -> bb*16   (overlaps LSN20)
+        #  T2 loses:   LSN60 [12,20) bb*8 -> cc*8        (nested in LSN30)
+        #              LSN65 [20,24) bb*4 -> ff*4        (adjacent to LSN60)
+        # Both loser updates are redone then undone.  Final bytes on
+        # [8,24) are uniformly bb, yet provenance differs per byte:
+        # redo@30, undo@60, undo@65 — identical hex must NOT merge.
+        wal = [
+            begin(10, "T1"),
+            upd(20, "T1", 10, 5, 0, "00" * 16, "aa" * 16),
+            upd(30, "T1", 20, 5, 8, "aa" * 8 + "00" * 8, "bb" * 16),
+            begin(35, "T2"),
+            commit(40, "T1", 30),
+            end(50, "T1", 40),
+            upd(60, "T2", 35, 5, 12, "bb" * 8, "cc" * 8),
+            upd(65, "T2", 60, 5, 20, "bb" * 4, "ff" * 4),
+        ]
+        return run("prov-overlap", [page(5, ZEROS, page_lsn=10)], wal)
+
+    def test_writes_frozen_in_verdict(self):
+        v = self._overlap_verdict()
+        p5 = next(p for p in v["pages"] if p["page"] == 5)
+        self.assertEqual(
+            [(w["category"], w["lsn"], w["xid"], w["offset"], w["length"])
+             for w in p5["byteWrites"]],
+            [("redo", 20, "T1", 0, 16),
+             ("redo", 30, "T1", 8, 16),
+             ("redo", 60, "T2", 12, 8),
+             ("redo", 65, "T2", 20, 4),
+             ("undo", 65, "T2", 20, 4),
+             ("undo", 60, "T2", 12, 8)],
+        )
+        # bytes carried with every write are the actual image applied.
+        self.assertEqual(p5["byteWrites"][2]["bytes"], "cc" * 8)
+        self.assertEqual(p5["byteWrites"][5]["bytes"], "bb" * 8)
+
+    def test_partition_covers_range_without_gap_or_overlap(self):
+        v = self._overlap_verdict()
+        r = query_byte_provenance(v, 5, 0, 32)
+        fr = r["fragments"]
+        self.assertEqual(fr[0]["start"], 0)
+        self.assertEqual(fr[-1]["end"], 32)
+        for a, b in zip(fr, fr[1:]):
+            self.assertEqual(a["end"], b["start"])  # touching, no gap/overlap
+        for f in fr:
+            # final hex matches the frozen final page
+            page_hex = next(p for p in v["pages"] if p["page"] == 5)["data"]
+            self.assertEqual(f["hex"], page_hex[2 * f["start"]:2 * f["end"]])
+
+    def test_last_actual_write_wins_and_only_identical_evidence_merges(self):
+        v = self._overlap_verdict()
+        r = query_byte_provenance(v, 5, 0, 32)
+        self.assertEqual(
+            [(f["start"], f["end"], f["category"], f["xid"], f["lsn"])
+             for f in r["fragments"]],
+            [(0, 8, "redo", "T1", 20),
+             (8, 12, "redo", "T1", 30),
+             (12, 20, "undo", "T2", 60),
+             (20, 24, "undo", "T2", 65),
+             (24, 32, "crash-image", None, None)],
+        )
+        # The three bb fragments on [8,24) carry identical final hex but
+        # distinct evidence and therefore stay separate.
+        mid = [f for f in r["fragments"] if 8 <= f["start"] < 24]
+        self.assertEqual([f["hex"] for f in mid], ["bb" * 4, "bb" * 8, "bb" * 4])
+        self.assertEqual(len({(f["category"], f["lsn"]) for f in mid}), 3)
+
+    def test_range_is_clipped_to_write_boundaries(self):
+        v = self._overlap_verdict()
+        # Asking a sub-range wholly inside the undo fragment merges into one.
+        r = query_byte_provenance(v, 5, 13, 19)
+        self.assertEqual(
+            [(f["start"], f["end"], f["category"], f["lsn"]) for f in r["fragments"]],
+            [(13, 19, "undo", 60)],
+        )
+        self.assertEqual(r["fragments"][0]["hex"], "bb" * 6)
+        # Crossing evidence boundaries re-cuts fragments at the request edge.
+        r = query_byte_provenance(v, 5, 10, 26)
+        self.assertEqual(
+            [(f["start"], f["end"], f["category"], f["lsn"]) for f in r["fragments"]],
+            [(10, 12, "redo", 30),
+             (12, 20, "undo", 60),
+             (20, 24, "undo", 65),
+             (24, 26, "crash-image", None)],
+        )
+
+    def test_unrewritten_bytes_are_crash_image(self):
+        # LSN20 already on the crashed image -> redo is skipped (no actual
+        # write); its bytes must be attributed to the crash image, not redo.
+        v = run("prov-skip",
+                [page(9, zeros_with(0, "ab" * 8), page_lsn=20)],
+                [begin(10, "T1"),
+                 upd(20, "T1", 10, 9, 0, "00" * 8, "ab" * 8),
+                 commit(30, "T1", 20),
+                 end(40, "T1", 30)])
+        r = query_byte_provenance(v, 9, 0, 12)
+        self.assertEqual(len(r["fragments"]), 1)  # whole run merges
+        f = r["fragments"][0]
+        self.assertEqual(f["category"], "crash-image")
+        self.assertIsNone(f["lsn"])
+        self.assertIsNone(f["xid"])
+        self.assertEqual(f["hex"], "ab" * 8 + "00" * 4)
+
+    def test_interval_ending_exactly_at_page_boundary(self):
+        v = self._overlap_verdict()
+        r = query_byte_provenance(v, 5, 4090, PAGE_SIZE)
+        self.assertEqual(r["fragments"][0]["start"], 4090)
+        self.assertEqual(r["fragments"][0]["end"], 4096)
+        self.assertEqual(r["fragments"][0]["category"], "crash-image")
+
+    def test_unknown_page_is_actionable_404(self):
+        v = self._overlap_verdict()
+        with self.assertRaises(ProvenanceError) as ctx:
+            query_byte_provenance(v, 99, 0, 4)
+        self.assertEqual(ctx.exception.http_status, 404)
+        self.assertIn("99", str(ctx.exception))
+        self.assertIn("[5]", str(ctx.exception))  # lists known pages
+
+    def test_bad_intervals_are_actionable_400(self):
+        v = self._overlap_verdict()
+        for kwargs in (
+            dict(page=5, start=0, end=0),       # empty
+            dict(page=5, start=4, end=4),       # empty
+            dict(page=5, start=8, end=2),       # reversed
+            dict(page=5, start=0, end=4097),    # crosses boundary
+            dict(page=5, start=4096, end=4097),
+            dict(page=5, start=-1, end=2),
+            dict(page="x", start=0, end=2),
+            dict(page=5, start=1.5, end=2),
+            dict(page=5, start=True, end=2),
+        ):
+            with self.assertRaises(ProvenanceError) as ctx:
+                query_byte_provenance(v, **kwargs)
+            self.assertEqual(ctx.exception.http_status, 400, kwargs)
+        # end == 4096 itself is legal; 4097 is not.
+        with self.assertRaises(ProvenanceError) as ctx:
+            query_byte_provenance(v, 5, 0, 4096 + 1)
+        self.assertIn("4096", str(ctx.exception))
 
 
 class StoreTests(unittest.TestCase):

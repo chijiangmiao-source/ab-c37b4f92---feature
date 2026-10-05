@@ -38,6 +38,27 @@ class RecoveryError(ValueError):
     """Stable rejection: the recovery request is invalid and must not run."""
 
 
+class ProvenanceError(ValueError):
+    """A byte-provenance query is invalid (bad interval / unknown page).
+
+    ``http_status`` carries the status the HTTP layer should answer with;
+    the message is always actionable (says exactly what to change).
+    """
+
+    def __init__(self, message: str, http_status: int = 400) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+
+
+# Provenance source categories.  Every final byte is exactly one of:
+#   CRASH_IMAGE — never rewritten during recovery (retains the crashed image)
+#   REDO        — last actual write was a redo of an update's after-image
+#   UNDO        — last actual write was an undo write-back of a before-image
+CRASH_IMAGE = "crash-image"
+REDO = "redo"
+UNDO = "undo"
+
+
 @dataclass
 class Record:
     lsn: int
@@ -62,6 +83,11 @@ class PageState:
     page_lsn: Optional[int]
     initial_lsn: Optional[int]
     initial_sha: str
+    # Every ACTUAL page write during recovery (a redo rewrite or an undo
+    # write-back), appended in execution order.  Skipped/idempotent passes
+    # are not recorded: provenance reflects the last write that really
+    # touched each byte.
+    writes: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _hex_to_bytes(value: Any, field_name: str, expected_len: Optional[int] = None) -> bytes:
@@ -534,6 +560,16 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
             st.page_lsn = rec.lsn
             changed = True
             redone += 1
+            st.writes.append(
+                {
+                    "category": REDO,
+                    "lsn": rec.lsn,
+                    "xid": rec.xid,
+                    "offset": rec.offset,
+                    "length": rec.length,
+                    "bytes": rec.after.hex(),
+                }
+            )
             criterion = (
                 f"重做判据：pageLSN={'无' if before_lsn is None else before_lsn} "
                 f"< LSN {rec.lsn} 且区间等于 before → 确有缺失，重做"
@@ -655,6 +691,16 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
         st.data[rec.offset : rec.offset + rec.length] = rec.before
         st.page_lsn = rec.prev_lsn if rec.prev_lsn else None
         undone += 1
+        st.writes.append(
+            {
+                "category": UNDO,
+                "lsn": rec.lsn,
+                "xid": rec.xid,
+                "offset": rec.offset,
+                "length": rec.length,
+                "bytes": rec.before.hex(),
+            }
+        )
         trace.append(
             {
                 "phase": "undo",
@@ -694,6 +740,9 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
                 "sha256After": _sha256(final),
                 "changed": final != st.initial_data,
                 "data": final.hex(),
+                # Frozen per-page byte-level write evidence in execution
+                # order; drives half-open byte-range provenance queries.
+                "byteWrites": [dict(w) for w in st.writes],
             }
         )
 
@@ -711,4 +760,148 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
         "dirtyPageTableAtEnd": dpt,
         "pages": page_summary,
         "trace": trace,
+    }
+
+
+# ===================== byte-provenance query ==============================
+
+
+def _coerce_bound(value: Any, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ProvenanceError(f"{name} 必须是非负整数")
+    if value < 0:
+        raise ProvenanceError(f"{name} 不能为负（收到 {value}）")
+    return value
+
+
+def query_byte_provenance(verdict: dict[str, Any], page: Any, start: Any, end: Any) -> dict[str, Any]:
+    """Trace the provenance of the final bytes of *page* over the half-open
+    in-page interval ``[start, end)`` within a frozen accepted *verdict*.
+
+    The answer is a partition of exactly the requested range into
+    contiguous, ascending, non-overlapping, gap-free byte fragments.  Each
+    fragment reports its final hex bytes, a source category
+    (``crash-image`` / ``redo`` / ``undo``) and — for redo/undo — the
+    associated transaction id and WAL LSN of the write that last touched
+    every byte in it.
+
+    Semantics:
+      * Only ACTUAL page writes during recovery (redo rewrites and undo
+        write-backs) are evidence.  A skipped/idempotent pass writes
+        nothing, so bytes it merely inspected stay attributed to whatever
+        wrote them before (ultimately the crashed page image).
+      * Each byte is attributed to the last actual write covering it;
+        bytes never rewritten are explicitly the crashed page image.
+      * Whether redo and undo on the same page overlap, nest or merely sit
+        adjacent, the result is re-cut strictly along the requested range:
+        no overlaps, no gaps, strictly ascending.
+      * Adjacent fragments merge only when their evidence is identical
+        (same category, xid and LSN); crash-image runs merge with each
+        other, but never with a redo/undo fragment.
+
+    Raises ProvenanceError (with an actionable message) for an unknown
+    page, malformed bounds, an empty/non-half-open interval or a range
+    crossing the 4096-byte page boundary.
+    """
+    page_no = _coerce_bound(page, "page")
+    lo = _coerce_bound(start, "start")
+    hi = _coerce_bound(end, "end")
+    if lo >= hi:
+        raise ProvenanceError(
+            f"半开字节区间 [start,end) 必须非空且 start < end（收到 [{lo},{hi})）"
+        )
+    if hi > PAGE_SIZE:
+        raise ProvenanceError(
+            f"半开字节区间 [{lo},{hi}) 越过 {PAGE_SIZE} 字节页边界；"
+            f"合法 end 取值为 {min(lo + 1, PAGE_SIZE)}..{PAGE_SIZE}（且 start < end）"
+        )
+
+    page_row = next((p for p in verdict.get("pages", []) if p.get("page") == page_no), None)
+    if page_row is None:
+        known = sorted(p.get("page") for p in verdict.get("pages", []))
+        raise ProvenanceError(
+            f"审计 {verdict.get('auditId')!r} 中不存在页 {page_no}；"
+            f"该裁决已知页号为 {known or '∅'}，请核对页号或改用其中之一",
+            http_status=404,
+        )
+
+    final_hex = page_row.get("data", "")
+    try:
+        final_bytes = bytes.fromhex(final_hex)
+    except (TypeError, ValueError):
+        raise ProvenanceError("冻结裁决中的最终页数据损坏，无法追溯")
+    if len(final_bytes) != PAGE_SIZE:
+        raise ProvenanceError("冻结裁决中的最终页长度异常，无法追溯")
+
+    # Replay only the actual writes, clipped to [lo, hi), in execution order.
+    # `owner[b]` is the winning write evidence for byte b, or None for a
+    # byte that retains the crashed image.
+    owner: list[Optional[dict[str, Any]]] = [None] * (hi - lo)
+    for w in page_row.get("byteWrites", []):
+        w_lo = max(int(w["offset"]), lo)
+        w_hi = min(int(w["offset"]) + int(w["length"]), hi)
+        if w_lo >= w_hi:
+            continue
+        evidence = {
+            "category": w["category"],
+            "lsn": w["lsn"],
+            "xid": w["xid"],
+        }
+        for b in range(w_lo - lo, w_hi - lo):
+            owner[b] = evidence
+
+    def evidence_at(i: int) -> dict[str, Any]:
+        ev = owner[i]
+        if ev is None:
+            return {"category": CRASH_IMAGE, "lsn": None, "xid": None}
+        return dict(ev)
+
+    def same_evidence(a: Optional[dict[str, Any]], b: Optional[dict[str, Any]]) -> bool:
+        if a is None or b is None:
+            return a is b
+        return (
+            a["category"] == b["category"]
+            and a["lsn"] == b["lsn"]
+            and a["xid"] == b["xid"]
+        )
+
+    # Coalesce maximal adjacent runs whose evidence is identical.
+    fragments: list[dict[str, Any]] = []
+    run_start = 0
+    run_ev = evidence_at(0)
+    for i in range(1, hi - lo):
+        ev = evidence_at(i)
+        if not same_evidence(ev, run_ev):
+            fragments.append(_make_fragment(final_bytes, lo, run_start, i, run_ev))
+            run_start = i
+            run_ev = ev
+    fragments.append(_make_fragment(final_bytes, lo, run_start, hi - lo, run_ev))
+
+    return {
+        "auditId": verdict.get("auditId"),
+        "page": page_no,
+        "start": lo,
+        "end": hi,
+        "pageSize": PAGE_SIZE,
+        "fragments": fragments,
+    }
+
+
+def _make_fragment(
+    final_bytes: bytes,
+    range_lo: int,
+    rel_start: int,
+    rel_end: int,
+    evidence: dict[str, Any],
+) -> dict[str, Any]:
+    abs_start = range_lo + rel_start
+    abs_end = range_lo + rel_end
+    return {
+        "start": abs_start,
+        "end": abs_end,
+        "length": abs_end - abs_start,
+        "hex": final_bytes[abs_start:abs_end].hex(),
+        "category": evidence["category"],
+        "xid": evidence["xid"],
+        "lsn": evidence["lsn"],
     }
