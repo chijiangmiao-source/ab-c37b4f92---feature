@@ -18,7 +18,16 @@ const els = {
   onlyChanged: $("#onlyChanged"),
   lookup: $("#lookup"),
   lookupId: $("#lookupId"),
+  provPage: $("#provPage"),
+  provOffset: $("#provOffset"),
+  provLength: $("#provLength"),
+  provQuery: $("#provQuery"),
+  provStatus: $("#provStatus"),
+  provWrap: $("#provWrap"),
+  provBody: $("#provTable tbody"),
 };
+
+const SOURCE_LABEL = { crash: "崩溃页像", redo: "重做写入", undo: "撤销回写" };
 
 let sampleCache = null;
 
@@ -45,6 +54,8 @@ function shortSha(sha) {
 
 function renderVerdict(v) {
   window._lastTrace = v.trace;
+  window._lastAuditId = v.auditId;
+  resetProvenance();
   els.verdictCard.classList.remove("hidden");
   const dptText = Object.entries(v.dirtyPageTableAtEnd)
     .map(([p, l]) => `${p}:${l}`)
@@ -144,6 +155,64 @@ async function submitRecovery() {
   }
 }
 
+function resetProvenance() {
+  els.provBody.innerHTML = "";
+  els.provWrap.classList.add("hidden");
+  els.provStatus.textContent = "";
+  els.provStatus.className = "status";
+}
+
+function setProvStatus(kind, text) {
+  els.provStatus.className = `status ${kind}`;
+  els.provStatus.textContent = text;
+}
+
+function hexPreview(hex) {
+  return hex.length <= 64 ? hex : `${hex.slice(0, 48)}…${hex.slice(-16)}`;
+}
+
+async function queryProvenance() {
+  const id = window._lastAuditId;
+  if (!id) {
+    setProvStatus("err", "请先提交恢复或读取一个已冻结的成功裁决");
+    return;
+  }
+  const page = els.provPage.value.trim();
+  const offset = els.provOffset.value.trim();
+  const length = els.provLength.value.trim();
+  if (!page || !offset || !length) {
+    setProvStatus("err", "页号、偏移、长度均须填写（半开区间 [offset, offset+length)）");
+    return;
+  }
+  setProvStatus("info", `查询 ${id} 页 ${page} [${offset}, ${Number(offset) + Number(length)}) 的来源…`);
+  try {
+    const url = `/api/provenance?auditId=${encodeURIComponent(id)}&page=${encodeURIComponent(page)}` +
+      `&offset=${encodeURIComponent(offset)}&length=${encodeURIComponent(length)}`;
+    const resp = await fetch(url);
+    const data = await resp.json();
+    if (!resp.ok) {
+      els.provWrap.classList.add("hidden");
+      setProvStatus("err", `查询失败（HTTP ${resp.status}）：${data.error}`);
+      return;
+    }
+    els.provBody.innerHTML = "";
+    for (const s of data.segments) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td class="monospace">[${s.offset}, ${s.offset + s.length})</td>
+        <td><span class="pill ${s.source}">${SOURCE_LABEL[s.source] || s.source}</span></td>
+        <td>${esc(s.xid || "—")}</td>
+        <td class="monospace">${lsn(s.lsn)}</td>
+        <td class="monospace hex" title="${esc(s.hex)}">${esc(hexPreview(s.hex))}</td>`;
+      els.provBody.appendChild(tr);
+    }
+    els.provWrap.classList.remove("hidden");
+    setProvStatus("ok", `共 ${data.segments.length} 段，连续覆盖 [${data.offset}, ${data.offset + data.length})。`);
+  } catch (e) {
+    setProvStatus("err", `请求失败：${e.message}`);
+  }
+}
+
 async function lookupVerdict() {
   const id = els.lookupId.value.trim() || els.auditId.value.trim();
   if (!id) {
@@ -174,6 +243,7 @@ async function lookupVerdict() {
 document.addEventListener("DOMContentLoaded", () => {
   els.submit.addEventListener("click", submitRecovery);
   els.lookup.addEventListener("click", lookupVerdict);
+  els.provQuery.addEventListener("click", queryProvenance);
   els.loadSample.addEventListener("click", () => {
     if (sampleCache) {
       els.payload.value = JSON.stringify(sampleCache, null, 2);

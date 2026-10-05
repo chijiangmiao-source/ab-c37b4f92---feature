@@ -78,11 +78,38 @@
         <tbody></tbody>
       </table>
     </div>
+
+    <h3>参数字节来源追溯（页号 + 半开字节区间 [offset, offset+length)）</h3>
+    <div class="prov-bar">
+      <label>页号
+        <input id="provPage" type="number" min="0" step="1" placeholder="如 7">
+      </label>
+      <label>偏移 offset
+        <input id="provOffset" type="number" min="0" max="4095" step="1" placeholder="0–4095">
+      </label>
+      <label>长度 length
+        <input id="provLength" type="number" min="1" max="4096" step="1" placeholder="1–4096">
+      </label>
+      <button id="provQuery" type="button">查询来源</button>
+      <span id="provStatus" class="status"></span>
+    </div>
+    <div class="table-wrap hidden" id="provWrap">
+      <table id="provTable">
+        <thead>
+          <tr>
+            <th>半开区间</th><th>来源类别</th><th>事务</th><th>LSN</th>
+            <th>最终字节（hex）</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
   </section>
 </main>
 
 <footer>
   <span>验证规则：断链 · 重复 LSN · 错误前像 · 越界区间 · 已结束事务仍被引用 → 稳定拒绝（HTTP 422）并清除该标识的旧成功证据。</span>
+  <span>成功裁决支持按“页号 + 半开字节区间”追溯每段最终字节的来源：崩溃页像 / 重做写入 / 撤销回写（含事务与 LSN），查询只读、不改写冻结裁决。</span>
 </footer>
 
 <script src="/static/app.js"></script>

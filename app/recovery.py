@@ -38,6 +38,16 @@ class RecoveryError(ValueError):
     """Stable rejection: the recovery request is invalid and must not run."""
 
 
+class ProvenanceError(ValueError):
+    """Actionable error for a byte-provenance query (unknown page,
+    out-of-range interval, ...).  Carries the HTTP status the caller
+    should answer with; never mutates the frozen verdict."""
+
+    def __init__(self, message: str, status: int = 400) -> None:
+        super().__init__(message)
+        self.status = status
+
+
 @dataclass
 class Record:
     lsn: int
@@ -388,6 +398,10 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
     _validate_chain(records, by_lsn, cp)
 
     trace: list[dict[str, Any]] = []
+    # Every actual page rewrite, in execution order: redo applies the after
+    # image, undo writes the before image back.  Frozen into the verdict so
+    # auditors can later trace which source any final byte came from.
+    writes: list[dict[str, Any]] = []
 
     # ================= ANALYSIS ==========================================
     dpt: dict[int, int] = {}                       # page -> recLSN
@@ -534,6 +548,17 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
             st.page_lsn = rec.lsn
             changed = True
             redone += 1
+            writes.append(
+                {
+                    "page": rec.page,
+                    "offset": rec.offset,
+                    "length": rec.length,
+                    "hex": rec.after.hex(),
+                    "source": "redo",
+                    "xid": rec.xid,
+                    "lsn": rec.lsn,
+                }
+            )
             criterion = (
                 f"重做判据：pageLSN={'无' if before_lsn is None else before_lsn} "
                 f"< LSN {rec.lsn} 且区间等于 before → 确有缺失，重做"
@@ -655,6 +680,17 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
         st.data[rec.offset : rec.offset + rec.length] = rec.before
         st.page_lsn = rec.prev_lsn if rec.prev_lsn else None
         undone += 1
+        writes.append(
+            {
+                "page": rec.page,
+                "offset": rec.offset,
+                "length": rec.length,
+                "hex": rec.before.hex(),
+                "source": "undo",
+                "xid": rec.xid,
+                "lsn": rec.lsn,
+            }
+        )
         trace.append(
             {
                 "phase": "undo",
@@ -710,5 +746,92 @@ def recover(payload: dict[str, Any]) -> dict[str, Any]:
         "undone": undone,
         "dirtyPageTableAtEnd": dpt,
         "pages": page_summary,
+        "writes": writes,
         "trace": trace,
     }
+
+
+def page_provenance(
+    verdict: dict[str, Any], page_no: int, offset: int, length: int
+) -> list[dict[str, Any]]:
+    """Trace the final source of every byte in [offset, offset+length).
+
+    Works purely on a frozen verdict (its final page image plus the frozen
+    write events) and never mutates it.  Returns ascending, non-overlapping
+    segments that cover the requested half-open interval without gaps; each
+    segment carries the final hex bytes, a source class (``crash`` = the
+    crashed page image, ``redo`` = a redone update, ``undo`` = a loser
+    rollback write-back) and the associated transaction / LSN.
+
+    The last actual write wins: redo/undo events on the same page may
+    overlap, contain or merely abut each other — later events simply
+    overwrite the ownership map.  Adjacent bytes are merged into one
+    segment only when their source evidence (source, xid, lsn) is
+    identical; bytes never rewritten are explicitly classed as ``crash``.
+    """
+    for value, name, minimum in (
+        (page_no, "page", 0),
+        (offset, "offset", 0),
+        (length, "length", 1),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+            floor = "非负" if minimum == 0 else "正"
+            raise ProvenanceError(f"{name} 必须是{floor}整数，收到 {value!r}")
+    if offset + length > PAGE_SIZE:
+        raise ProvenanceError(
+            f"半开区间 [{offset},{offset + length}) 越过 {PAGE_SIZE} 字节页边界"
+            f"（offset+length 最大为 {PAGE_SIZE}）"
+        )
+
+    summary = next(
+        (p for p in verdict.get("pages", []) if p.get("page") == page_no), None
+    )
+    if summary is None:
+        known = sorted(
+            p["page"] for p in verdict.get("pages", []) if isinstance(p.get("page"), int)
+        )
+        raise ProvenanceError(
+            f"页 {page_no} 不在该冻结裁决中（可用页：{known if known else '无'}）",
+            status=404,
+        )
+
+    final = bytes.fromhex(summary["data"])
+
+    # owner[i] = index of the write event that last rewrote byte i;
+    # None means the byte survived from the crashed page image.
+    writes = [w for w in verdict.get("writes", []) if w.get("page") == page_no]
+    owner: list[Optional[int]] = [None] * PAGE_SIZE
+    for idx, w in enumerate(writes):
+        start = w["offset"]
+        owner[start : start + w["length"]] = [idx] * w["length"]
+
+    segments: list[dict[str, Any]] = []
+    pos = offset
+    end = offset + length
+    while pos < end:
+        ev = owner[pos]
+        stop = pos + 1
+        while stop < end and owner[stop] == ev:
+            stop += 1
+        if ev is None:
+            seg = {
+                "offset": pos,
+                "length": stop - pos,
+                "hex": final[pos:stop].hex(),
+                "source": "crash",
+                "xid": None,
+                "lsn": None,
+            }
+        else:
+            w = writes[ev]
+            seg = {
+                "offset": pos,
+                "length": stop - pos,
+                "hex": final[pos:stop].hex(),
+                "source": w["source"],
+                "xid": w["xid"],
+                "lsn": w["lsn"],
+            }
+        segments.append(seg)
+        pos = stop
+    return segments

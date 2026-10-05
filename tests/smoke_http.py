@@ -154,6 +154,58 @@ def run_checks(base: str, managed_proc, managed_tmp) -> int:
         check("loser bytes rolled back", p7["data"][32:40] == "00" * 4)
         check("committed T1 bytes remain", p7["data"].startswith("11" * 16))
 
+        # 6b. byte provenance over the frozen loser verdict
+        status, prov = request(
+            "GET", f"{base}/api/provenance?auditId=SMOKE-LOSER&page=7&offset=0&length=32",
+            expect=200)
+        segs = prov["segments"]
+        check("provenance covers request without gaps/overlap",
+              segs[0]["offset"] == 0
+              and segs[-1]["offset"] + segs[-1]["length"] == 32
+              and all(segs[i]["offset"] + segs[i]["length"] == segs[i + 1]["offset"]
+                      for i in range(len(segs) - 1)))
+        check("provenance segments ascending",
+              [s["offset"] for s in segs] == sorted(s["offset"] for s in segs))
+        check("crash / undo / crash classes",
+              [s["source"] for s in segs] == ["crash", "undo", "crash"])
+        undo_seg = segs[1]
+        check("undone segment evidence (interval, hex, xid, lsn)",
+              undo_seg["offset"] == 16 and undo_seg["length"] == 4
+              and undo_seg["hex"] == "00000000"
+              and undo_seg["xid"] == "T2" and undo_seg["lsn"] == 60)
+        check("crash segment hex comes from crashed image", segs[0]["hex"] == "11" * 16)
+        status, prov = request(
+            "GET", f"{base}/api/provenance?auditId=SMOKE-LOSER&page=9&offset=0&length=4096",
+            expect=200)
+        check("untouched page is a single crash segment",
+              len(prov["segments"]) == 1 and prov["segments"][0]["source"] == "crash")
+
+        # 6c. provenance errors are actionable and the query is read-only
+        status, payload = request(
+            "GET", f"{base}/api/provenance?auditId=SMOKE-LOSER&page=999&offset=0&length=4",
+            expect=404)
+        check("unknown page -> 404 with usable page list", "可用页" in payload["error"])
+        status, payload = request(
+            "GET", f"{base}/api/provenance?auditId=SMOKE-LOSER&page=7&offset=4090&length=16",
+            expect=400)
+        check("interval past 4096 boundary -> 400", "4096" in payload["error"])
+        status, payload = request(
+            "GET", f"{base}/api/provenance?auditId=SMOKE-LOSER&page=7&offset=0",
+            expect=400)
+        check("missing length -> 400", "length" in payload["error"])
+        status, payload = request(
+            "GET", f"{base}/api/provenance?auditId=SMOKE-LOSER&page=7&offset=abc&length=4",
+            expect=400)
+        check("non-integer offset -> 400", "offset" in payload["error"])
+        status, payload = request(
+            "GET", f"{base}/api/provenance?auditId=NOPE&page=7&offset=0&length=4",
+            expect=404)
+        check("unknown auditId -> 404", status == 404)
+        status, payload = request("GET", f"{base}/api/audit?auditId=SMOKE-LOSER")
+        check("provenance queries left the frozen verdict intact",
+              status == 200 and payload["status"] == "accepted"
+              and payload["verdict"]["loserTransactions"] == ["T2"])
+
         # 7. corrupted predecessor chain -> stable rejection
         corrupted = json.loads(json.dumps(committed))
         corrupted["auditId"] = "SMOKE-REJECT"
@@ -162,6 +214,11 @@ def run_checks(base: str, managed_proc, managed_tmp) -> int:
         check("broken chain rejected 422", status == 422 and "断链" in payload["error"])
         status, payload = request("GET", f"{base}/api/audit?auditId=SMOKE-REJECT")
         check("rejection frozen as rejected", payload["status"] == "rejected")
+        status, payload = request(
+            "GET", f"{base}/api/provenance?auditId=SMOKE-REJECT&page=1&offset=0&length=4",
+            expect=409)
+        check("rejected audit provenance -> 409 actionable",
+              "稳定拒绝" in payload["error"])
 
         # 8. rejection of same audit id CLEARS earlier success evidence
         status, payload = request("POST", f"{base}/api/recover", committed, expect=200)

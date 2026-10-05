@@ -4,6 +4,7 @@ Run: python -m unittest -v tests.test_recovery
 (no third-party dependencies)
 """
 
+import json
 import os
 import sys
 import tempfile
@@ -11,7 +12,7 @@ import unittest
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "app"))
 
-from recovery import RecoveryError, recover  # noqa: E402
+from recovery import ProvenanceError, RecoveryError, page_provenance, recover  # noqa: E402
 from storage import AuditStore  # noqa: E402
 
 ZEROS = "00" * 4096
@@ -382,6 +383,190 @@ class StableRejectionTests(unittest.TestCase):
     def test_missing_audit_id_rejected(self):
         with self.assertRaises(RecoveryError):
             recover({"pages": [page(0)], "wal": []})
+
+
+class ProvenanceTests(unittest.TestCase):
+    """Byte-provenance queries over a frozen verdict."""
+
+    def assert_contiguous(self, segs, start, end):
+        """Segments must be ascending, non-overlapping and gap-free over
+        the requested half-open interval [start, end)."""
+        self.assertTrue(segs)
+        self.assertEqual(segs[0]["offset"], start)
+        pos = start
+        for s in segs:
+            self.assertEqual(s["offset"], pos, "区间之间不得有空洞或重叠")
+            pos += s["length"]
+        self.assertEqual(pos, end)
+        self.assertEqual([s["offset"] for s in segs],
+                         sorted(s["offset"] for s in segs))
+
+    def loser_verdict(self):
+        # Same shape as /api/sample: T2's LSN-60 update on page 7 is
+        # redone, then undone (T2 is a loser).
+        pages = [
+            page(7, zeros_with(0, "11" * 16), page_lsn=30),
+            page(9, zeros_with(0, "ab" * 8), page_lsn=20),
+        ]
+        wal = [
+            begin(10, "T1"),
+            upd(20, "T1", 10, 9, 0, "00" * 8, "ab" * 8),
+            upd(30, "T1", 20, 7, 0, "00" * 16, "11" * 16),
+            begin(35, "T2"),
+            {"lsn": 40, "type": "checkpoint",
+             "transactions": {"T1": 30, "T2": 35},
+             "dirtyPages": {"7": 30}},
+            upd(60, "T2", 35, 7, 16, "00000000", "22222222"),
+            commit(70, "T1", 30),
+            end(80, "T1", 70),
+        ]
+        return run("prov-loser", pages, wal)
+
+    def test_verdict_freezes_actual_write_events(self):
+        v = self.loser_verdict()
+        # LSN 20/30 were already on the crashed images (skipped by redo);
+        # only the redone-then-undone LSN 60 produced write events.
+        self.assertEqual(
+            [(w["page"], w["offset"], w["length"], w["source"], w["xid"], w["lsn"])
+             for w in v["writes"]],
+            [(7, 16, 4, "redo", "T2", 60), (7, 16, 4, "undo", "T2", 60)],
+        )
+        self.assertEqual(v["writes"][0]["hex"], "22222222")   # redo applies after
+        self.assertEqual(v["writes"][1]["hex"], "00000000")   # undo writes before back
+
+    def test_redone_then_undone_interval_reports_undo_as_final_source(self):
+        v = self.loser_verdict()
+        segs = page_provenance(v, 7, 0, 32)
+        self.assert_contiguous(segs, 0, 32)
+        self.assertEqual([s["source"] for s in segs], ["crash", "undo", "crash"])
+        # Committed T1 bytes survived from the crashed image.
+        self.assertEqual((segs[0]["offset"], segs[0]["length"]), (0, 16))
+        self.assertEqual(segs[0]["hex"], "11" * 16)
+        self.assertIsNone(segs[0]["xid"])
+        self.assertIsNone(segs[0]["lsn"])
+        # The last actual write over [16,20) is the undo write-back.
+        self.assertEqual((segs[1]["offset"], segs[1]["length"]), (16, 4))
+        self.assertEqual(segs[1]["hex"], "00000000")
+        self.assertEqual(segs[1]["xid"], "T2")
+        self.assertEqual(segs[1]["lsn"], 60)
+        # Untouched tail bytes are explicitly the crashed image.
+        self.assertEqual((segs[2]["offset"], segs[2]["length"]), (20, 12))
+        self.assertEqual(segs[2]["hex"], "00" * 12)
+
+    def test_query_inside_a_single_write(self):
+        v = self.loser_verdict()
+        segs = page_provenance(v, 7, 18, 2)
+        self.assert_contiguous(segs, 18, 20)
+        self.assertEqual(len(segs), 1)
+        self.assertEqual(segs[0]["source"], "undo")
+        self.assertEqual(segs[0]["hex"], "0000")
+
+    def test_untouched_page_is_one_crash_segment(self):
+        v = self.loser_verdict()
+        segs = page_provenance(v, 9, 0, 4096)
+        self.assert_contiguous(segs, 0, 4096)
+        self.assertEqual(len(segs), 1)
+        self.assertEqual(segs[0]["source"], "crash")
+        self.assertTrue(segs[0]["hex"].startswith("ab" * 8))
+
+    def test_overlapping_redos_last_write_wins(self):
+        wal = [
+            begin(10, "T1"),
+            upd(20, "T1", 10, 1, 0, "00" * 8, "aa" * 8),
+            begin(25, "T2"),
+            upd(30, "T2", 25, 1, 4, "aa" * 4 + "00" * 4, "bb" * 8),
+            commit(40, "T1", 20),
+            end(45, "T1", 40),
+            commit(50, "T2", 30),
+            end(55, "T2", 50),
+        ]
+        v = run("prov-overlap", [page(1, ZEROS)], wal)
+        segs = page_provenance(v, 1, 0, 16)
+        self.assert_contiguous(segs, 0, 16)
+        self.assertEqual(
+            [(s["offset"], s["length"], s["source"], s["xid"], s["lsn"]) for s in segs],
+            [(0, 4, "redo", "T1", 20), (4, 8, "redo", "T2", 30), (12, 4, "crash", None, None)],
+        )
+        self.assertEqual(segs[0]["hex"], "aa" * 4)
+        self.assertEqual(segs[1]["hex"], "bb" * 8)
+        self.assertEqual(segs[2]["hex"], "00" * 4)
+
+    def test_contained_redo_splits_outer_write_into_two_segments(self):
+        wal = [
+            begin(10, "T1"),
+            upd(20, "T1", 10, 1, 0, "00" * 16, "aa" * 16),
+            begin(25, "T2"),
+            upd(30, "T2", 25, 1, 4, "aa" * 4, "bb" * 4),
+            commit(40, "T1", 20),
+            end(45, "T1", 40),
+            commit(50, "T2", 30),
+            end(55, "T2", 50),
+        ]
+        v = run("prov-contain", [page(1, ZEROS)], wal)
+        segs = page_provenance(v, 1, 0, 16)
+        self.assert_contiguous(segs, 0, 16)
+        # The LSN-20 write appears twice but the parts are not adjacent,
+        # so they must NOT be merged.
+        self.assertEqual(
+            [(s["offset"], s["length"], s["lsn"]) for s in segs],
+            [(0, 4, 20), (4, 4, 30), (8, 8, 20)],
+        )
+
+    def test_adjacent_writes_with_different_evidence_are_not_merged(self):
+        wal = [
+            begin(10, "T1"),
+            upd(20, "T1", 10, 1, 0, "00" * 4, "aa" * 4),
+            begin(25, "T2"),
+            upd(30, "T2", 25, 1, 4, "00" * 4, "bb" * 4),
+            commit(40, "T1", 20),
+            end(45, "T1", 40),
+            commit(50, "T2", 30),
+            end(55, "T2", 50),
+        ]
+        v = run("prov-adjacent", [page(1, ZEROS)], wal)
+        # Merely abutting intervals from different records stay separate.
+        segs = page_provenance(v, 1, 0, 8)
+        self.assert_contiguous(segs, 0, 8)
+        self.assertEqual([(s["offset"], s["length"], s["lsn"]) for s in segs],
+                         [(0, 4, 20), (4, 4, 30)])
+        # A query fully inside one record's interval yields a single segment.
+        segs = page_provenance(v, 1, 1, 2)
+        self.assertEqual(len(segs), 1)
+        self.assertEqual((segs[0]["source"], segs[0]["lsn"]), ("redo", 20))
+
+    def test_query_boundary_at_page_end_is_valid(self):
+        v = self.loser_verdict()
+        segs = page_provenance(v, 7, 4095, 1)
+        self.assert_contiguous(segs, 4095, 4096)
+        self.assertEqual(segs[0]["source"], "crash")
+
+    def test_unknown_page_is_actionable_404(self):
+        v = self.loser_verdict()
+        with self.assertRaises(ProvenanceError) as ctx:
+            page_provenance(v, 999, 0, 4)
+        self.assertEqual(ctx.exception.status, 404)
+        self.assertIn("可用页", str(ctx.exception))
+
+    def test_interval_past_page_boundary_rejected(self):
+        v = self.loser_verdict()
+        with self.assertRaises(ProvenanceError) as ctx:
+            page_provenance(v, 7, 4090, 16)
+        self.assertEqual(ctx.exception.status, 400)
+        self.assertIn("4096", str(ctx.exception))
+
+    def test_invalid_interval_arguments_rejected(self):
+        v = self.loser_verdict()
+        for args in ((7, 0, 0), (7, -1, 4), (7, 0, -8), (-1, 0, 4)):
+            with self.assertRaises(ProvenanceError) as ctx:
+                page_provenance(v, *args)
+            self.assertEqual(ctx.exception.status, 400)
+
+    def test_provenance_query_does_not_mutate_verdict(self):
+        v = self.loser_verdict()
+        frozen = json.dumps(v, sort_keys=True)
+        page_provenance(v, 7, 0, 4096)
+        page_provenance(v, 9, 16, 100)
+        self.assertEqual(json.dumps(v, sort_keys=True), frozen)
 
 
 class StoreTests(unittest.TestCase):

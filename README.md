@@ -45,6 +45,36 @@ docker compose run --rm verify
 | GET | `/api/sample` | 内置演示场景 |
 | POST | `/api/recover` | 提交页像 + WAL，返回冻结裁决或 422 拒绝 |
 | GET | `/api/audit?auditId=...` | 读取该稳定审计标识的冻结裁决/拒绝 |
+| GET | `/api/provenance?auditId=...&page=...&offset=...&length=...` | 字节来源追溯（只读） |
+
+### 字节来源追溯
+
+对已冻结的**成功**裁决，可按“页号 + 半开字节区间 `[offset, offset+length)`”
+查询每段最终字节的来源，无需逐条手工比对 WAL：
+
+```bash
+curl "http://localhost:8080/api/provenance?auditId=AOC-AUDIT-DEMO-0001&page=7&offset=0&length=32"
+```
+
+响应按升序返回连续覆盖请求区间（无重叠、无空洞）的片段；每段给出最终十六进制、
+来源类别与关联事务/LSN：
+
+```json
+{
+  "auditId": "AOC-AUDIT-DEMO-0001", "page": 7, "offset": 0, "length": 32,
+  "segments": [
+    {"offset": 0,  "length": 16, "hex": "1111…", "source": "crash", "xid": null, "lsn": null},
+    {"offset": 16, "length": 4,  "hex": "00000000", "source": "undo", "xid": "T2", "lsn": 60},
+    {"offset": 20, "length": 12, "hex": "0000…", "source": "crash", "xid": null, "lsn": null}
+  ]
+}
+```
+
+- `source`：`crash` 崩溃页像（未被改写的字节）/ `redo` 被重做的更新 / `undo` 失败事务撤销后的回写。
+- 同一页上的多次重做/撤销无论覆盖、包含还是仅相邻，都以**最后一次实际写入**为准；
+  相邻字节仅在来源证据（source、xid、lsn）完全相同时才合并为一段。
+- 错误均可操作：未知审计 404、已稳定拒绝的审计 409、未知页 404（附可用页列表）、
+  越过 4096 字节边界的区间或非法参数 400。查询只读，不改写冻结裁决、不清除成功证据。
 
 ### 请求示例
 
@@ -85,13 +115,13 @@ python tests/smoke_http.py                   # 自启服务并跑 API/HTTP 冒�
 
 ```
 app/
-  recovery.py    # ARIES 分析/重做/撤销引擎与全部稳定拒绝规则
+  recovery.py    # ARIES 分析/重做/撤销引擎、稳定拒绝规则与字节来源追溯
   storage.py     # SQLite 冻结裁决存储（拒绝时清除旧成功证据）
   server.py      # http.server：页面 / API / healthz
   static/        # 浏览器 UI
 tests/
-  test_recovery.py  # 规则单元测试
-  smoke_http.py     # API/HTTP 冒烟
+  test_recovery.py  # 规则单元测试（含来源追溯）
+  smoke_http.py     # API/HTTP 冒烟（含来源追溯验收）
   verify.sh         # verify 容器入口（三阶段）
 Dockerfile
 docker-compose.yml
